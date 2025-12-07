@@ -1,28 +1,154 @@
-import {setFailed} from '@actions/core';
-import {extractErrorMessage} from '@augment-vir/common';
-import {log} from '@augment-vir/node-js';
-import {setupGit} from '../util/setup-git';
-import {loadConfig} from './load-config';
-import {applyFormatting} from './sub-actions/apply-formatting';
+import {check} from '@augment-vir/assert';
+import {
+    awaitedBlockingMap,
+    awaitedForEach,
+    ensureError,
+    extractErrorMessage,
+    log,
+    wait,
+    type MaybePromise,
+} from '@augment-vir/common';
+import simpleGit from 'simple-git';
+import {type ScriptParams} from '../config/config.js';
+import {type GithubPullRequest} from '../data/github.js';
+import {getCompleteReviewStatus} from '../data/reviews.js';
+import {fetchGithubPullRequest} from '../services/fetch-github-pull-request.js';
+import {SilentError} from '../silent.error.js';
+import {clearPreviousRuns} from '../util/clear-previous-runs.js';
+import {extractEnvVars} from '../util/extract-env-vars.js';
+import {logJson} from '../util/log-json.js';
+import {determineCodeOwners} from './code-owners.js';
+import {loadConfig} from './load-config.js';
+import {autoAssignAuthor} from './sub-actions/auto-assign-author.js';
+import {blockNoMerge} from './sub-actions/block-no-merge.js';
+import {checkPrimaryReviewers} from './sub-actions/check-primary-reviewers.js';
+import {insertCodeOwners} from './sub-actions/insert-code-owners.js';
+import {requireReviewers} from './sub-actions/require-reviewers.js';
+import {waitForParent} from './sub-actions/wait-for-parent-pull-request.js';
 
-export async function runAction() {
+/**
+ * These are in order of least likely to fail to more likely to fail, so we can run as many of them
+ * as possible before they fail.
+ */
+const subActions: ReadonlyArray<(params: ScriptParams) => MaybePromise<void>> = [
+    insertCodeOwners,
+    autoAssignAuthor,
+    blockNoMerge,
+    requireReviewers,
+    waitForParent,
+    checkPrimaryReviewers,
+];
+
+async function runAction() {
+    /**
+     * Wait because GitHub is slow to update, which causes race conditions with this action being
+     * triggered and it reading the data.
+     */
+    await wait({seconds: 10});
+
     try {
-        const config = await loadConfig();
-        log.faint('received config:');
-        log.faint(JSON.stringify(config, null, 4));
+        const {branchName, currentRunId, octokit, repo, repoDir, workflowName} = extractEnvVars();
 
-        const git = await setupGit();
-        const cwd = process.cwd();
+        await clearPreviousRuns({branchName, currentRunId, octokit, repo, workflowName});
 
-        if (config.applyFormatting?.command) {
-            await applyFormatting(git, config.applyFormatting.command, cwd);
+        const config = await loadConfig(repoDir);
+
+        const pullRequest: GithubPullRequest | undefined = await fetchGithubPullRequest(
+            octokit,
+            branchName,
+        );
+
+        if (pullRequest) {
+            log.faint(`Using pull request #${pullRequest.number}: ${pullRequest.title}`);
+        } else {
+            throw new Error(`No pull request found for branch '${branchName}'`);
         }
+
+        if (config.ignoreDraft && pullRequest.draft) {
+            throw new Error('Aborting checks because Pull Request is a draft.');
+        }
+
+        const reviews = await getCompleteReviewStatus({octokit, pullRequest, repo});
+        log.faint('current approvals');
+        logJson(reviews, 'faint');
+        const git = simpleGit(repoDir);
+
+        const mergeBase = (
+            await git.raw([
+                'merge-base',
+                pullRequest.head.sha,
+                pullRequest.base.sha,
+            ])
+        ).trim();
+
+        log.faint(`merge base: ${mergeBase}`);
+
+        const changedFilePaths = (
+            await git.diff([
+                '--name-only',
+                // cspell:ignore ACMR
+                '--diff-filter=ACMR',
+                mergeBase,
+                pullRequest.head.sha,
+            ])
+        )
+            .trim()
+            .split('\n');
+
+        log.faint('changed files');
+        logJson(changedFilePaths, 'faint');
+
+        const codeOwners = determineCodeOwners(config.reviewRules || [], changedFilePaths);
+
+        log.faint('code owners');
+        logJson(codeOwners, 'faint');
+
+        const subActionParams: ScriptParams = {
+            config,
+            octokit,
+            pullRequest,
+            repo,
+            repoDir,
+            reviews,
+            codeOwners,
+            git,
+            changedFilePaths,
+        };
+
+        const errors: Error[] = (
+            await awaitedBlockingMap(subActions, async (subAction) => {
+                try {
+                    await subAction(subActionParams);
+                    return undefined;
+                } catch (error) {
+                    log.error(extractErrorMessage(error));
+                    return ensureError(error);
+                }
+            })
+        ).filter(check.isTruthy);
+
+        if (config.scripts?.length) {
+            log.faint('Running custom user scripts...');
+            await awaitedForEach(config.scripts, async (script) => {
+                log.faint(`Running ${script.name || 'anonymous'} script...`);
+                await script(subActionParams);
+            });
+        }
+
+        if (errors.length) {
+            throw new SilentError();
+        }
+
+        log.faint('');
+        log.success('pull-request-vir finished');
     } catch (error) {
-        log.error(error);
-        setFailed(extractErrorMessage(error));
+        if (!(error instanceof SilentError)) {
+            log.error(extractErrorMessage(error));
+        }
+        log.faint('');
+        log.error('pull-request-vir failed');
+        process.exit(1);
     }
 }
 
-if (require.main === module) {
-    runAction();
-}
+await runAction();

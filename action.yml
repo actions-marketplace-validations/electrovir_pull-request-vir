@@ -4,12 +4,15 @@ branding:
     icon: 'git-pull-request'
     color: 'blue'
 inputs:
-    config-file:
+    config_file:
         description: 'TypeScript config file'
         required: true
+    token:
+        description: 'Token used to access the repo with'
+        default: ${{ github.token }}
 outputs:
     status:
         description: 'The result of the checks'
 runs:
     using: 'node20'
-    main: 'dist-action/action/run-action.js'
+    main: 'src/action/action-entry-point.js'
