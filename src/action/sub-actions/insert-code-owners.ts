@@ -1,5 +1,7 @@
-import {log, safeMatch, type SelectFrom} from '@augment-vir/common';
-import {type ScriptParams} from '../../config/config.js';
+import {removeDuplicates, safeMatch} from '@augment-vir/common';
+import {createHash} from 'node:crypto';
+import {type CodeOwners} from '../../config/config.js';
+import {primaryReviewersComments} from './insert-primary-reviewers.js';
 
 const codeOwnersComments = {
     start: '<!-- code owners start -->',
@@ -7,68 +9,44 @@ const codeOwnersComments = {
 };
 
 const codeOwnersCommentsRegExp = new RegExp(
-    `${codeOwnersComments.start}[^<]*${codeOwnersComments.end}`,
+    String.raw`${codeOwnersComments.start}[\S\s]*?${codeOwnersComments.end}`,
 );
 
-export async function insertCodeOwners({
-    config,
-    octokit,
-    pullRequest,
+type DetermineNewPullRequestBodyParams = Readonly<{
+    author: string | undefined;
+    body: string;
+    codeOwners: Readonly<CodeOwners>;
+    pullRequestUrl: string;
+}>;
+
+type CreateCodeOwnerEntriesParams = Readonly<{
+    author: string | undefined;
+    codeOwners: Readonly<CodeOwners>;
+    pullRequestUrl: string;
+}>;
+
+type CodeOwnedFileLink = Readonly<{
+    filePath: string;
+    url: string;
+}>;
+
+type CodeOwnerEntry = Readonly<{
+    username: string;
+    fileLinks: ReadonlyArray<CodeOwnedFileLink>;
+}>;
+
+export function determineNewPullRequestBody({
+    author,
+    body,
     codeOwners,
-    repo,
-}: Readonly<
-    SelectFrom<
-        ScriptParams,
-        {
-            repo: {
-                owner: true;
-                repo: true;
-            };
-            config: {
-                insertCodeOwners: true;
-            };
-            octokit: true;
-            pullRequest: {
-                number: true;
-                body: true;
-                user: {
-                    login: true;
-                };
-            };
-            codeOwners: true;
-        }
-    >
->): Promise<void> {
-    if (!config.insertCodeOwners) {
-        log.success('Skipping code owners insertion.');
-        return;
-    }
-
-    const newBody = determineNewPullRequestBody(
-        Object.keys(codeOwners).filter((codeOwner) => codeOwner !== pullRequest.user?.login),
-        pullRequest.body || '',
-    );
-
-    if (!newBody) {
-        log.success('No code owners to insert.');
-        return;
-    }
-
-    await octokit.rest.pulls.update({
-        owner: repo.owner,
-        pull_number: pullRequest.number,
-        repo: repo.repo,
-        body: newBody,
+    pullRequestUrl,
+}: DetermineNewPullRequestBodyParams): string | undefined {
+    const codeOwnerEntries = createCodeOwnerEntries({
+        author,
+        codeOwners,
+        pullRequestUrl,
     });
-
-    log.success('Code owners inserted.');
-}
-
-function determineNewPullRequestBody(
-    codeOwners: ReadonlyArray<string>,
-    body: string,
-): string | undefined {
-    const codeOwnersInsertionIndex = findCodeOwnersInsertionIndex(body || '');
+    const codeOwnersInsertionIndex = findCodeOwnersInsertionIndex(body);
 
     const codeOwnersString = [
         codeOwnersComments.start,
@@ -76,13 +54,14 @@ function determineNewPullRequestBody(
         '**',
         'Code owners',
         '**',
-        ': ',
-        codeOwners.map((username) => `@${username}`).join(', '),
+        ':',
+        '\n',
+        codeOwnerEntries.map(createCodeOwnerSection).join('\n'),
         '\n',
         codeOwnersComments.end,
     ].join('');
 
-    if (!codeOwners.length) {
+    if (!codeOwnerEntries.length) {
         if (body.includes(codeOwnersComments.start)) {
             return body.replace(codeOwnersCommentsRegExp, '');
         } else {
@@ -101,12 +80,86 @@ function determineNewPullRequestBody(
     }
 }
 
+function createCodeOwnerEntries({
+    author,
+    codeOwners,
+    pullRequestUrl,
+}: CreateCodeOwnerEntriesParams): CodeOwnerEntry[] {
+    return Object.entries(codeOwners)
+        .filter(([username]) => username !== author)
+        .map(
+            ([
+                username,
+                filePaths,
+            ]) => {
+                return {
+                    username,
+                    fileLinks: removeDuplicates(filePaths).map((filePath) => {
+                        return {
+                            filePath,
+                            url: createPullRequestFileUrl({
+                                filePath,
+                                pullRequestUrl,
+                            }),
+                        };
+                    }),
+                };
+            },
+        );
+}
+
+function createCodeOwnerSection({fileLinks, username}: CodeOwnerEntry): string {
+    return [
+        '<details>',
+        `<summary>@${username} Owned files</summary>`,
+        '',
+        ...fileLinks.map(({filePath, url}) => {
+            return `- [${escapeMarkdownLinkText({
+                filePath,
+            })}](${url})`;
+        }),
+        '',
+        '</details>',
+    ].join('\n');
+}
+
+function createPullRequestFileUrl({
+    filePath,
+    pullRequestUrl,
+}: Readonly<{
+    filePath: string;
+    pullRequestUrl: string;
+}>): string {
+    return [
+        pullRequestUrl.replace(/\/$/, ''),
+        '/files#diff-',
+        createHash('sha256').update(filePath).digest('hex'),
+    ].join('');
+}
+
+function escapeMarkdownLinkText({
+    filePath,
+}: Readonly<{
+    filePath: string;
+}>): string {
+    return filePath
+        .replaceAll(/\\/g, String.raw`\\`)
+        .replaceAll('[', String.raw`\[`)
+        .replaceAll(']', String.raw`\]`);
+}
+
 function findCodeOwnersInsertionIndex(body: string): number | undefined {
     if (!body) {
         return undefined;
     }
 
-    const [primaryReviewerMatch] = safeMatch(body, /primary reviewers?\*?\*?:/i);
+    /**
+     * Insert after the whole inserted primary reviewers block, if there is one, so that its markers
+     * and its parser-required trailing blank line stay intact.
+     */
+    const [primaryReviewerMatch] = body.includes(primaryReviewersComments.end)
+        ? [primaryReviewersComments.end]
+        : safeMatch(body, /primary reviewers?\*?\*?:/i);
 
     if (primaryReviewerMatch) {
         const primaryReviewerIndex = body.indexOf(primaryReviewerMatch);

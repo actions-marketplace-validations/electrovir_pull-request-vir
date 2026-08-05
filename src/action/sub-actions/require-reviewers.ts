@@ -10,6 +10,14 @@ import {type PullRequestReviews, type ReviewRule, type ScriptParams} from '../..
 import {type GithubPullRequest, type GithubRepo, type Octokit} from '../../data/github.js';
 import {SilentError} from '../../silent.error.js';
 import {logJson} from '../../util/log-json.js';
+import {
+    determineReviewRuleContext,
+    isAppliesToMatched,
+    isCodeOwnsMatched,
+    isFallbackActive,
+    resolveRule,
+    type ReviewRuleContext,
+} from '../review-rules.js';
 
 export async function requireReviewers({
     config,
@@ -23,6 +31,7 @@ export async function requireReviewers({
         ScriptParams,
         {
             config: {
+                assignToAuthor: true;
                 reviewRules: true;
             };
             octokit: {
@@ -40,6 +49,9 @@ export async function requireReviewers({
                 user: {
                     login: true;
                 };
+                assignees: {
+                    login: true;
+                };
             };
             codeOwners: true;
         }
@@ -51,7 +63,16 @@ export async function requireReviewers({
     }
 
     /** Wait for logging to finish? Cause GitHub Actions jumbles them all up. */
-    await wait({milliseconds: 100});
+    await wait({
+        milliseconds: 100,
+    });
+
+    const context = determineReviewRuleContext({
+        config,
+        pullRequest,
+        reviews,
+        codeOwners,
+    });
 
     const failedRules = (
         await awaitedBlockingMap(config.reviewRules, async (rule, index) => {
@@ -61,7 +82,7 @@ export async function requireReviewers({
                 octokit,
                 pullRequest,
                 repo,
-                codeOwners: Object.keys(codeOwners),
+                context,
                 ruleIndex: index,
             });
             if (!failure) {
@@ -77,7 +98,9 @@ export async function requireReviewers({
     ).filter(check.isTruthy);
 
     /** Wait for logging to finish? Cause GitHub Actions jumbles them all up. */
-    await wait({milliseconds: 100});
+    await wait({
+        milliseconds: 100,
+    });
 
     if (failedRules.length) {
         log.error('Failed review rules.');
@@ -94,7 +117,7 @@ async function checkReviewRule({
     octokit,
     pullRequest,
     repo,
-    codeOwners,
+    context,
     ruleIndex,
 }: {
     reviews: Readonly<PullRequestReviews>;
@@ -123,35 +146,29 @@ async function checkReviewRule({
         >
     >;
     repo: Readonly<GithubRepo>;
-    codeOwners: ReadonlyArray<string>;
+    context: ReviewRuleContext;
     ruleIndex: number;
 }): Promise<undefined | {failureReason: string}> {
-    const author = pullRequest.user?.login || '';
-    const ruleOverride = author ? rawRule.userOverrides?.[author] : undefined;
-    const rule = ruleOverride ?? rawRule;
+    const rule = resolveRule(rawRule, context.author);
 
     if (!rule.users || !check.isLengthAtLeast(rule.users, 1)) {
         log.warning(`No users for rule at index '${ruleIndex}'`);
         return undefined;
-    }
-
-    if (rule.users.length === 1 && author && rule.users[0] === author) {
-        log.faint(`Ignoring rule because the author is the only rule user.`);
+    } else if (!isAppliesToMatched(rule, context.assignees)) {
+        /** Ignore this rule because none of the pull request's assignees matches `appliesTo`. */
+        return undefined;
+    } else if (rule.users.length === 1 && context.author && rule.users[0] === context.author) {
+        log.faint('Ignoring rule because the author is the only rule user.');
         logJson(rule, 'faint');
         return undefined;
-    }
-
-    if (
-        rule.codeOwns?.paths?.length &&
-        !rule.users.some((username) => codeOwners.includes(username))
-    ) {
-        /** Ignore this rule because its `codeOwns` field is not matched. */
+    } else if (!isCodeOwnsMatched(rule, context.codeOwners) && !isFallbackActive(rule, context)) {
+        /** Ignore this rule because its `codeOwns` field is not matched and it is not a fallback. */
         return undefined;
     }
 
     const reviewers = rule.users.reduce(
         (accum, user) => {
-            if (user === author) {
+            if (user === context.author) {
                 return accum;
             }
 

@@ -60,6 +60,28 @@ export const reviewRuleWithoutOverridesShape = defineShape({
      */
     autoAdd: optionalShape(true),
     /**
+     * Marks this rule as a fallback rule. A fallback rule's users are only auto-added (and their
+     * reviews only required) when no other rule has added any reviewers to the pull request.
+     *
+     * This is useful for defining default reviewers that should only be pulled in when a pull
+     * request isn't already covered by a more specific (e.g. code ownership) rule.
+     *
+     * Combined with `autoAdd`, `appliesTo`, and `codeOwns`, this rule's users are auto-added when:
+     * `autoAdd` is `true` AND an `appliesTo` username is assigned AND (this rule's `codeOwns`
+     * matches OR (`isFallback` is `true` AND no other rule added reviewers)).
+     */
+    isFallback: optionalShape(true),
+    /**
+     * Marks this rule's users as primary reviewers. When the rule applies to a pull request, its
+     * users are written into the pull request's description under a "Primary reviewers" line, which
+     * both `checkPrimaryReviewer` and [review-vir](https://github.com/electrovir/review-vir) read.
+     *
+     * All of the rule's users are marked as primary, regardless of `required`. The description is
+     * left alone if it already mentions a primary reviewer that this action didn't insert, so a
+     * manually chosen primary reviewer always wins.
+     */
+    isPrimary: optionalShape(true),
+    /**
      * A list of user names to consider as reviewers. No `@` or other prefix is necessary, just type
      * their username directly.
      *
@@ -73,6 +95,24 @@ export const reviewRuleWithoutOverridesShape = defineShape({
      * @default 'all'
      */
     required: optionalShape(unionShape(exactShape('all'), 1)),
+    /**
+     * Restricts the rule to pull requests that have at least one of these usernames as an assignee.
+     * If omitted or empty, the rule applies to all pull requests.
+     *
+     * A pull request with no assignees counts as assigned to its author, matching what
+     * `assignToAuthor` does.
+     *
+     * @example
+     *
+     * ```ts
+     * // require a review from 'reviewer' on every pull request assigned to 'assignee'
+     * {
+     *     users: ['reviewer'],
+     *     appliesTo: ['assignee'],
+     * }
+     * ```
+     */
+    appliesTo: optionalShape(['']),
     /**
      * The rule will only be required if the pull request changed file paths matching any of the
      * given strings or regular expressions, ignoring the `notPaths` strings or regular
@@ -190,8 +230,7 @@ export const pullRequestVirConfigShape = defineShape({
     insertCodeOwners: optionalShape(true),
     /** Arbitrary scripts that will be executed in order on a pull request. */
     scripts: optionalShape([
-        (() => {}) as AnyFunction as TypedFunction<ScriptParams,
-            Promise<void>>,
+        (() => {}) as AnyFunction as TypedFunction<ScriptParams, Promise<void>>,
     ]),
 });
 

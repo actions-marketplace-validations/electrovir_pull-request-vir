@@ -4,7 +4,7 @@ import {SilentError} from '../../silent.error.js';
 import {logJson} from '../../util/log-json.js';
 import {parseGitPatch} from '../../util/parse-git-patch.js';
 
-export async function blockNoMerge({config, octokit, pullRequest, repo}: ScriptParams) {
+export async function blockNoMerge({config, git, pullRequest}: ScriptParams) {
     if (!config.blockNoMerge) {
         log.success('"no merge" phrases are disabled, skipping check.');
         return;
@@ -16,15 +16,10 @@ export async function blockNoMerge({config, octokit, pullRequest, repo}: ScriptP
 
     const hasNoMergeTitle = includesNoMergePhrase(pullRequest.title);
 
-    const patchContents = (
-        await octokit.rest.pulls.get({
-            ...repo,
-            pull_number: pullRequest.number,
-            mediaType: {
-                format: 'patch',
-            },
-        })
-    ).data as unknown as string;
+    const patchContents = await getPullRequestPatch({
+        git,
+        pullRequest,
+    });
 
     const patch = parseGitPatch(patchContents);
 
@@ -74,8 +69,27 @@ const expandedNoMergePhrases = baseNoMergePhrases.flatMap((phrase) => [
     phrase.replace(' ', ''),
 ]);
 
-const noMergeRegExp = new RegExp(`\\b(?:${expandedNoMergePhrases.join('|')})\\b`, 'i');
+const noMergeRegExp = new RegExp(String.raw`\b(?:${expandedNoMergePhrases.join('|')})\b`, 'i');
 
 export function includesNoMergePhrase(text: string): boolean {
     return !!text.match(noMergeRegExp);
+}
+
+async function getPullRequestPatch({
+    git,
+    pullRequest,
+}: Readonly<Pick<ScriptParams, 'git' | 'pullRequest'>>): Promise<string> {
+    const mergeBase = (
+        await git.raw([
+            'merge-base',
+            pullRequest.head.sha,
+            pullRequest.base.sha,
+        ])
+    ).trim();
+
+    return await git.diff([
+        '--diff-filter=ACMR',
+        mergeBase,
+        pullRequest.head.sha,
+    ]);
 }
